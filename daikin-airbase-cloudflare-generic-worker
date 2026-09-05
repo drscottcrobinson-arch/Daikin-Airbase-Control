@@ -28,6 +28,7 @@ const FAN_R = { "0": "auto", "1": "low", "3": "medium", "5": "high" };
 
 const DEFAULT_CONFIG = {
   schedules: [],
+  schedulesDisabled: false,
 };
 
 function num(v, fallback = null) {
@@ -157,6 +158,7 @@ async function getConfig(env) {
     schedules: Array.isArray(stored?.schedules)
       ? stored.schedules.map(normaliseSchedule)
       : [],
+    schedulesDisabled: stored?.schedulesDisabled === true,
   };
 }
 
@@ -165,6 +167,7 @@ async function saveConfig(env, config) {
     schedules: Array.isArray(config?.schedules)
       ? config.schedules.map(normaliseSchedule)
       : [],
+    schedulesDisabled: config?.schedulesDisabled === true,
   };
 
   await env.DAIKIN_CONFIG.put(
@@ -409,6 +412,10 @@ async function runSchedules(env, timestamp = Date.now()) {
   const date = new Date(timestamp);
   const local = localParts(env, date);
 
+  if (config.schedulesDisabled === true) {
+    return;
+  }
+
   for (const schedule of config.schedules) {
     if (!scheduleMatches(env, schedule, date)) {
       continue;
@@ -597,6 +604,67 @@ label{
   border:1px solid #fecdca;
   color:#b42318;
 }
+
+.live-controls{
+  display:grid;
+  grid-template-columns:repeat(4,minmax(0,1fr));
+  gap:11px;
+  margin-top:11px;
+}
+.control-tile{
+  border:1px solid #d9e2ec;
+  border-radius:14px;
+  background:linear-gradient(180deg,#fff,#f8fbff);
+  padding:13px;
+  min-height:94px;
+  text-align:left;
+  width:100%;
+  color:var(--text);
+}
+.control-tile .v{font-size:1.28rem}
+.control-tile.interactive:hover{border-color:#84adff}
+.setpoint-control{
+  display:grid;
+  grid-template-columns:44px 1fr 44px;
+  align-items:center;
+  gap:7px;
+  margin-top:6px;
+}
+.setpoint-control button{
+  padding:8px 4px;
+  font-size:1.25rem;
+  font-weight:700;
+  min-height:40px;
+}
+.setpoint-value{
+  text-align:center;
+  font-size:1.3rem;
+  font-weight:750;
+}
+.schedule-master{
+  display:flex;
+  align-items:center;
+  justify-content:space-between;
+  gap:12px;
+  border:1px solid #fedf89;
+  background:#fffaeb;
+  border-radius:12px;
+  padding:12px 13px;
+  margin-bottom:14px;
+}
+.schedule-master label{
+  display:flex;
+  align-items:center;
+  gap:9px;
+  margin:0;
+  font-weight:700;
+}
+.schedule-master input{width:auto}
+button.changed{
+  outline:2px solid #12b76a;
+  outline-offset:2px;
+}
+
 details.panel{overflow:hidden}
 details.panel summary{
   list-style:none;
@@ -635,11 +703,24 @@ details.panel[open] summary{
   margin-right:12px;
 }
 @media(max-width:600px){
-  body{padding:14px 10px 32px}
-  .hero{padding:18px;border-radius:16px}
-  .c,details.panel{border-radius:13px}
-  .g{grid-template-columns:repeat(2,minmax(0,1fr))}
+  body{padding:10px 8px 28px}
+  .w{max-width:100%}
+  .hero{padding:16px;border-radius:15px;margin-bottom:11px}
+  .hero h1{font-size:1.35rem}
+  .c,details.panel{border-radius:13px;margin-bottom:10px}
+  .c{padding:13px}
+  .panel-body{padding:13px}
+  .g{grid-template-columns:repeat(2,minmax(0,1fr));gap:8px}
+  .live-controls{grid-template-columns:repeat(2,minmax(0,1fr));gap:8px}
+  .control-tile{min-height:88px;padding:11px}
+  .r{grid-template-columns:1fr}
+  .days{grid-template-columns:repeat(4,1fr);row-gap:7px}
   .summary-note{display:none}
+  button,input,select{min-height:42px}
+  .schedule-master{align-items:flex-start}
+}
+@media(max-width:380px){
+  .g,.live-controls{grid-template-columns:1fr}
 }
 </style>
 </head>
@@ -667,7 +748,7 @@ details.panel[open] summary{
 </details>
 
 <div class="c">
-  <h2>Live status</h2>
+  <h2>Live status &amp; control</h2>
 
   <div class="g">
     <div class="m">
@@ -679,69 +760,36 @@ details.panel[open] summary{
       <div class="l">Outdoor</div>
       <div class="v" id="outdoor">—</div>
     </div>
+  </div>
 
-    <div class="m">
-      <div class="l">Power</div>
+  <div class="live-controls">
+    <button id="powerTile" class="control-tile interactive" onclick="togglePower()">
+      <div class="l">Power · tap to toggle</div>
       <div class="v" id="power">—</div>
-    </div>
+    </button>
 
-    <div class="m">
-      <div class="l">Mode</div>
+    <button id="modeTile" class="control-tile interactive" onclick="cycleMode()">
+      <div class="l">Mode · tap to cycle</div>
       <div class="v" id="modeV">—</div>
-    </div>
+    </button>
 
-    <div class="m">
+    <div class="control-tile">
       <div class="l">Setpoint</div>
-      <div class="v" id="tempV">—</div>
+      <div class="setpoint-control">
+        <button id="tempDown" onclick="adjustTemp(-1)">−</button>
+        <div class="setpoint-value" id="tempV">—</div>
+        <button id="tempUp" onclick="adjustTemp(1)">+</button>
+      </div>
     </div>
 
-    <div class="m">
-      <div class="l">Fan</div>
+    <button id="fanTile" class="control-tile interactive" onclick="cycleFan()">
+      <div class="l">Fan · tap to cycle</div>
       <div class="v" id="fanV">—</div>
-    </div>
-  </div>
-
-  <div class="r">
-    <button id="powerOnBtn" class="p" onclick="power(true)">
-      Power ON
-    </button>
-    <button id="powerOffBtn" onclick="power(false)">
-      Power OFF
     </button>
   </div>
 
-  <div id="powerFeedback" class="feedback"></div>
-
-  <div class="r">
-    <div>
-      <label>Mode</label>
-      <select id="mode">
-        <option>heat</option>
-        <option>cool</option>
-        <option>dry</option>
-      </select>
-      <button onclick="setMode()">Set mode</button>
-    </div>
-
-    <div>
-      <label>Setpoint °C</label>
-      <input id="temp" type="number" value="23">
-      <button onclick="setTemp()">Set temperature</button>
-    </div>
-
-    <div>
-      <label>Fan</label>
-      <select id="fan">
-        <option>auto</option>
-        <option>low</option>
-        <option>medium</option>
-        <option>high</option>
-      </select>
-      <button onclick="setFan()">Set fan</button>
-    </div>
-  </div>
+  <div id="liveFeedback" class="feedback"></div>
 </div>
-
 <details class="panel">
   <summary>
     Schedules
@@ -749,6 +797,14 @@ details.panel[open] summary{
   </summary>
 
   <div class="panel-body">
+    <div class="schedule-master">
+      <label>
+        <input id="disableSchedules" type="checkbox">
+        Disable all schedules
+      </label>
+      <span id="scheduleMasterState" class="muted">Schedules active</span>
+    </div>
+
     <div id="schedules"></div>
 
     <div class="r">
@@ -784,7 +840,14 @@ details.panel[open] summary{
 
 <script>
 const $ = (id) => document.getElementById(id);
-let cfg = { schedules: [] };
+let cfg = { schedules: [], schedulesDisabled: false };
+let liveState = {
+  power: null,
+  mode: null,
+  setpoint: null,
+  fan: null,
+};
+let liveBusy = false;
 
 function K(){
   return localStorage.getItem("daikinApiKey") || "";
@@ -870,6 +933,42 @@ function saveKey(){
   refreshAll(false);
 }
 
+function pretty(value){
+  if (value == null) return "—";
+  const s = String(value);
+  return s.charAt(0).toUpperCase() + s.slice(1);
+}
+
+function updateTempButtons(){
+  const down = $("tempDown");
+  const up = $("tempUp");
+
+  if (!down || !up) return;
+
+  const temperature = Number(liveState.setpoint);
+
+  if (
+    liveState.mode === "dry" ||
+    !Number.isFinite(temperature)
+  ){
+    down.disabled = true;
+    up.disabled = true;
+    return;
+  }
+
+  const min =
+    liveState.mode === "cool" ? 23 : 16;
+
+  const max =
+    liveState.mode === "cool" ? 32 : 31;
+
+  down.disabled =
+    liveBusy || temperature <= min;
+
+  up.disabled =
+    liveBusy || temperature >= max;
+}
+
 async function live(){
   const data = await api("/status");
 
@@ -883,163 +982,179 @@ async function live(){
       ? "—"
       : data.sensors.outdoorTemperature + "°C";
 
+  liveState = {
+    power: data.control.power === true,
+    mode: data.control.mode || null,
+    setpoint: data.control.setpoint,
+    fan: data.control.fan || null,
+  };
+
   $("power").textContent =
-    data.control.power ? "ON" : "OFF";
+    liveState.power ? "ON" : "OFF";
 
   $("modeV").textContent =
-    data.control.mode || "—";
+    pretty(liveState.mode);
 
   $("tempV").textContent =
-    data.control.setpoint == null
+    liveState.setpoint == null
       ? "—"
-      : data.control.setpoint + "°C";
+      : liveState.setpoint + "°C";
 
   $("fanV").textContent =
-    data.control.fan || "—";
+    pretty(liveState.fan);
 
-  if (data.control.mode){
-    $("mode").value = data.control.mode;
-  }
-
-  if (data.control.setpoint != null){
-    $("temp").value = data.control.setpoint;
-  }
-
-  if (data.control.fan){
-    $("fan").value = data.control.fan;
-  }
+  updateTempButtons();
 
   return data;
 }
 
-async function power(on){
-  const id =
-    on ? "powerOnBtn" : "powerOffBtn";
+async function liveCommand(path, payload, successMessage){
+  if (liveBusy) return;
+
+  liveBusy = true;
+  updateTempButtons();
+
+  feedback(
+    "liveFeedback",
+    "Sending command…",
+    "busy"
+  );
+
+  for (const id of [
+    "powerTile",
+    "modeTile",
+    "fanTile",
+  ]){
+    if ($(id)) $(id).disabled = true;
+  }
 
   try {
-    buttonBusy(
-      id,
-      true,
-      on ? "Turning ON…" : "Turning OFF…",
-      on ? "Power ON" : "Power OFF"
-    );
-
-    feedback(
-      "powerFeedback",
-      on
-        ? "Sending ON command…"
-        : "Sending OFF command…",
-      "busy"
-    );
-
-    const result = await api("/power", {
+    const result = await api(path, {
       method: "POST",
-      body: JSON.stringify({ on }),
+      body: JSON.stringify(payload),
     });
-
-    feedback(
-      "powerFeedback",
-      on
-        ? "Heat pump turned ON."
-        : "Heat pump turned OFF.",
-      "ok"
-    );
 
     msg(result);
     await live();
+
+    feedback(
+      "liveFeedback",
+      successMessage + " Confirmed by Daikin.",
+      "ok"
+    );
   } catch (error){
     feedback(
-      "powerFeedback",
+      "liveFeedback",
       error.message,
       "err"
     );
+
     msg(error.message);
+
+    await live().catch(() => {});
   } finally {
-    buttonBusy(
-      id,
-      false,
-      "",
-      on ? "Power ON" : "Power OFF"
-    );
+    liveBusy = false;
+
+    for (const id of [
+      "powerTile",
+      "modeTile",
+      "fanTile",
+    ]){
+      if ($(id)) $(id).disabled = false;
+    }
+
+    updateTempButtons();
   }
 }
 
-async function setMode(){
-  try {
-    const result = await api("/mode", {
-      method: "POST",
-      body: JSON.stringify({
-        mode: $("mode").value,
-      }),
-    });
+async function togglePower(){
+  if (liveState.power == null) return;
 
-    feedback(
-      "powerFeedback",
-      "Mode updated.",
-      "ok"
-    );
+  const on = !liveState.power;
 
-    msg(result);
-    await live();
-  } catch (error){
-    feedback(
-      "powerFeedback",
-      error.message,
-      "err"
-    );
-  }
+  await liveCommand(
+    "/power",
+    { on },
+    on ? "Power ON." : "Power OFF."
+  );
 }
 
-async function setTemp(){
-  try {
-    const result = await api("/setpoint", {
-      method: "POST",
-      body: JSON.stringify({
-        temperature: Number($("temp").value),
-      }),
-    });
+async function cycleMode(){
+  const modes = ["heat", "cool", "dry"];
+  const currentIndex =
+    modes.indexOf(liveState.mode);
 
-    feedback(
-      "powerFeedback",
-      "Temperature updated.",
-      "ok"
-    );
+  const next =
+    modes[
+      currentIndex >= 0
+        ? (currentIndex + 1) % modes.length
+        : 0
+    ];
 
-    msg(result);
-    await live();
-  } catch (error){
-    feedback(
-      "powerFeedback",
-      error.message,
-      "err"
-    );
-  }
+  await liveCommand(
+    "/mode",
+    { mode: next },
+    "Mode changed to " + pretty(next) + "."
+  );
 }
 
-async function setFan(){
-  try {
-    const result = await api("/fan", {
-      method: "POST",
-      body: JSON.stringify({
-        fan: $("fan").value,
-      }),
-    });
+async function cycleFan(){
+  const fans = [
+    "auto",
+    "low",
+    "medium",
+    "high",
+  ];
 
-    feedback(
-      "powerFeedback",
-      "Fan setting updated.",
-      "ok"
-    );
+  const currentIndex =
+    fans.indexOf(liveState.fan);
 
-    msg(result);
-    await live();
-  } catch (error){
-    feedback(
-      "powerFeedback",
-      error.message,
-      "err"
-    );
+  const next =
+    fans[
+      currentIndex >= 0
+        ? (currentIndex + 1) % fans.length
+        : 0
+    ];
+
+  await liveCommand(
+    "/fan",
+    { fan: next },
+    "Fan changed to " + pretty(next) + "."
+  );
+}
+
+async function adjustTemp(delta){
+  if (
+    liveBusy ||
+    liveState.mode === "dry"
+  ){
+    return;
   }
+
+  const current =
+    Number(liveState.setpoint);
+
+  if (!Number.isFinite(current)) return;
+
+  const min =
+    liveState.mode === "cool" ? 23 : 16;
+
+  const max =
+    liveState.mode === "cool" ? 32 : 31;
+
+  const next =
+    Math.min(
+      max,
+      Math.max(min, current + delta)
+    );
+
+  if (next === current) return;
+
+  await liveCommand(
+    "/setpoint",
+    { temperature: next },
+    "Setpoint changed to " + next + "°C."
+  );
 }
 
 function scheduleRow(schedule = {}){
@@ -1103,7 +1218,24 @@ function modeChange(select){
   );
 }
 
+function renderScheduleMaster(){
+  const checkbox = $("disableSchedules");
+  const label = $("scheduleMasterState");
+
+  if (!checkbox || !label) return;
+
+  checkbox.checked =
+    cfg?.schedulesDisabled === true;
+
+  label.textContent =
+    cfg?.schedulesDisabled === true
+      ? "All schedules disabled"
+      : "Schedules active";
+}
+
 function renderSchedules(){
+  renderScheduleMaster();
+
   const root = $("schedules");
   root.innerHTML = "";
 
@@ -1300,6 +1432,8 @@ async function saveSchedules(){
       method: "PUT",
       body: JSON.stringify({
         schedules: collectSchedules(),
+        schedulesDisabled:
+          $("disableSchedules").checked,
       }),
     });
 
