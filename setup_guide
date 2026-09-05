@@ -1,0 +1,611 @@
+DAIKIN AIRBASE + CLOUDFLARE WORKER CONTROLLER
+SETUP GUIDE
+============================================================
+
+Purpose
+-------
+This guide installs a simple Cloudflare Worker that controls a Daikin
+Airbase-compatible heat pump through the Daikin cloud service.
+
+The downloadable generic Worker provides:
+
+- live indoor and outdoor temperature
+- current power state
+- current operating mode
+- current set temperature
+- current fan setting
+- manual ON/OFF control
+- Heat / Cool / Dry mode selection
+- temperature setpoint control
+- fan control
+- configurable weekly schedules
+- a simple browser dashboard
+- password-like API-key protection for controller endpoints
+
+The generic version deliberately DOES NOT contain the solar automation
+module used in the original customised installation.
+
+
+IMPORTANT
+---------
+This is an independent community-style integration, not an official
+Daikin or Cloudflare product.
+
+The code has been tested against a Daikin Airbase system using the
+dascontroller.com /skyfi/aircon API. Daikin models, firmware versions,
+regions, and account configurations may differ.
+
+Do not publish your Daikin account password or controller API key.
+
+
+============================================================
+1. WHAT YOU NEED
+============================================================
+
+You need:
+
+1. A Daikin heat pump fitted with a compatible Daikin Airbase Wi-Fi
+   controller.
+
+2. A working Daikin Airbase account that can already control the heat
+   pump through the normal Daikin system.
+
+3. A free Cloudflare account.
+
+4. These Daikin cloud values:
+
+   AIRBASE_ID
+   AIRBASE_PASSWORD
+   AIRBASE_PORT
+   AIRBASE_DEVICE
+
+5. A controller API key of your own choosing:
+
+   DAIKIN_API_KEY
+
+6. The generic Worker code file supplied with this guide:
+
+   daikin-airbase-cloudflare-generic-worker.txt
+
+
+============================================================
+2. FIND YOUR AIRBASE VALUES
+============================================================
+
+AIRBASE_ID
+----------
+This is the account/login ID used by the Airbase cloud service.
+
+For tested Airbase installations it is the Airbase account identifier
+used with the Daikin Airbase cloud login. It may not necessarily be the
+friendly name of the heat pump.
+
+Use the same account identity that is associated with the working
+Airbase controller.
+
+
+AIRBASE_PASSWORD
+----------------
+This is the Airbase cloud password for that account.
+
+It is sent to the Airbase cloud API as the "spw" parameter.
+
+
+AIRBASE_PORT and AIRBASE_DEVICE
+-------------------------------
+These can be obtained from the Daikin Airbase cloud "device_list"
+endpoint.
+
+On a Mac, Linux computer, or Windows Terminal with curl available, run:
+
+curl "https://dascontroller.com/skyfi/aircon/device_list?id=YOUR_AIRBASE_ID&spw=YOUR_AIRBASE_PASSWORD"
+
+Replace:
+
+YOUR_AIRBASE_ID
+YOUR_AIRBASE_PASSWORD
+
+with your own values.
+
+The returned line contains the registered Airbase device information.
+
+A tested example had a device record similar in structure to:
+
+30050:...:DaikinAPxxxxx:...:DaikinAPxxxxx:...
+
+In that example:
+
+AIRBASE_PORT = 30050
+
+and the device identifier was the DaikinAPxxxxx identifier in the
+device record.
+
+Do not blindly copy the example values. Use the values returned for
+your own system.
+
+If device_list does not return a usable device, first confirm that the
+same account can control the heat pump normally through the Daikin
+Airbase service.
+
+
+============================================================
+3. CREATE THE CLOUDFLARE WORKER
+============================================================
+
+1. Sign in to Cloudflare.
+
+2. Open:
+
+   Workers & Pages
+
+3. Create a new Worker.
+
+4. Give it a name, for example:
+
+   daikin-airbase-controller
+
+5. Open the Worker code editor.
+
+6. Delete the sample Cloudflare code.
+
+7. Open:
+
+   daikin-airbase-cloudflare-generic-worker.txt
+
+8. Copy the entire contents into the Cloudflare editor.
+
+9. Deploy the Worker.
+
+
+============================================================
+4. CREATE THE KV NAMESPACE
+============================================================
+
+The Worker uses Cloudflare KV to store schedules.
+
+Create a KV namespace in Cloudflare.
+
+Suggested name:
+
+DaikinConfig
+
+Then add a KV binding to the Worker.
+
+The binding name MUST be exactly:
+
+DAIKIN_CONFIG
+
+The actual namespace name in Cloudflare can be different, but the
+Worker binding variable must be DAIKIN_CONFIG.
+
+
+============================================================
+5. ADD THE REQUIRED SECRETS
+============================================================
+
+Open the Worker's Settings / Variables and Secrets area.
+
+Add the following as encrypted secrets:
+
+AIRBASE_ID
+AIRBASE_PASSWORD
+AIRBASE_PORT
+AIRBASE_DEVICE
+DAIKIN_API_KEY
+
+Recommended:
+
+AIRBASE_ID
+  Your Airbase cloud account ID.
+
+AIRBASE_PASSWORD
+  Your Airbase cloud password.
+
+AIRBASE_PORT
+  The port returned by device_list, for example 30050 if that is what
+  your own device record reports.
+
+AIRBASE_DEVICE
+  Your own Daikin Airbase device identifier, normally the DaikinAP...
+  identifier reported in the device information.
+
+DAIKIN_API_KEY
+  Create this yourself. It protects the control API and dashboard
+  requests.
+
+Use a long random string rather than a simple password.
+
+
+============================================================
+6. SET YOUR TIME ZONE
+============================================================
+
+Add a normal Worker variable:
+
+TIMEZONE
+
+Use a valid IANA time-zone name.
+
+Examples:
+
+Pacific/Auckland
+Australia/Sydney
+Europe/London
+America/Los_Angeles
+
+If TIMEZONE is omitted, the supplied Worker defaults to:
+
+Pacific/Auckland
+
+The time zone matters because weekly schedules are evaluated in this
+time zone.
+
+
+============================================================
+7. ADD THE SCHEDULE TRIGGER
+============================================================
+
+The Worker checks schedules once per minute.
+
+In the Worker settings, add a Cron Trigger:
+
+* * * * *
+
+This means:
+
+run every minute
+
+The Worker prevents the same schedule from running repeatedly during
+the same scheduled minute.
+
+
+============================================================
+8. TEST THE WORKER
+============================================================
+
+After deployment, open your Worker URL.
+
+It will look similar to:
+
+https://YOUR-WORKER-NAME.YOUR-SUBDOMAIN.workers.dev/
+
+
+PUBLIC HEALTH TEST
+------------------
+The health endpoint does not require the API key.
+
+Run:
+
+curl "https://YOUR-WORKER-URL/health"
+
+You should receive JSON similar to:
+
+{
+  "ok": true,
+  "service": "daikin-airbase-controller",
+  "now": "...",
+  "timezone": "..."
+}
+
+
+AUTHENTICATED STATUS TEST
+-------------------------
+Run:
+
+curl "https://YOUR-WORKER-URL/status" \
+  -H "Authorization: Bearer YOUR_DAIKIN_API_KEY"
+
+If the Airbase details are correct, the response should contain:
+
+control
+sensors
+model
+
+
+============================================================
+9. USE THE WEB DASHBOARD
+============================================================
+
+Open:
+
+https://YOUR-WORKER-URL/
+
+The dashboard initially keeps API access and schedules collapsed.
+
+1. Open "API access".
+
+2. Enter the DAIKIN_API_KEY that you created in Cloudflare.
+
+3. Press "Save key".
+
+The key is stored in that browser's localStorage so it does not need to
+be typed each time on that device.
+
+You should then see:
+
+- indoor temperature
+- outdoor temperature
+- power state
+- operating mode
+- temperature setpoint
+- fan setting
+
+
+============================================================
+10. MANUAL CONTROL
+============================================================
+
+The dashboard provides:
+
+Power ON
+Power OFF
+
+Mode:
+Heat
+Cool
+Dry
+
+Temperature setpoint
+
+Fan:
+Auto
+Low
+Medium
+High
+
+The Worker reads the current complete Airbase control state before a
+write, changes only the requested item, and sends the complete state
+back to the Airbase API.
+
+This avoids unintentionally resetting unrelated Airbase settings.
+
+
+============================================================
+11. CREATE WEEKLY SCHEDULES
+============================================================
+
+Open the "Schedules" section.
+
+Press:
+
+Add schedule
+
+For each schedule select:
+
+- Enabled / disabled
+- Time
+- Days of the week
+- ON or OFF
+
+For an ON schedule also choose:
+
+- Heat / Cool / Dry
+- Temperature, except for Dry
+- Fan speed
+
+Then press:
+
+Save schedules
+
+A confirmation message should appear.
+
+
+Example weekday ON schedule:
+
+Monday-Friday
+06:30
+ON
+Heat
+23°C
+Auto fan
+
+Example weekday OFF schedule:
+
+Monday-Friday
+23:40
+OFF
+
+
+============================================================
+12. API ENDPOINTS
+============================================================
+
+Public:
+
+GET /health
+
+
+API-key protected:
+
+GET /status
+GET /sensors
+GET /config
+
+POST /power
+POST /mode
+POST /setpoint
+POST /fan
+
+PUT /config
+POST /config
+
+
+Example ON request:
+
+curl -X POST \
+  "https://YOUR-WORKER-URL/power" \
+  -H "Authorization: Bearer YOUR_DAIKIN_API_KEY" \
+  -H "Content-Type: application/json" \
+  -d '{"on":true}'
+
+
+Example OFF request:
+
+curl -X POST \
+  "https://YOUR-WORKER-URL/power" \
+  -H "Authorization: Bearer YOUR_DAIKIN_API_KEY" \
+  -H "Content-Type: application/json" \
+  -d '{"on":false}'
+
+
+Example Heat request:
+
+curl -X POST \
+  "https://YOUR-WORKER-URL/mode" \
+  -H "Authorization: Bearer YOUR_DAIKIN_API_KEY" \
+  -H "Content-Type: application/json" \
+  -d '{"mode":"heat"}'
+
+
+Example temperature request:
+
+curl -X POST \
+  "https://YOUR-WORKER-URL/setpoint" \
+  -H "Authorization: Bearer YOUR_DAIKIN_API_KEY" \
+  -H "Content-Type: application/json" \
+  -d '{"temperature":23}'
+
+
+Example fan request:
+
+curl -X POST \
+  "https://YOUR-WORKER-URL/fan" \
+  -H "Authorization: Bearer YOUR_DAIKIN_API_KEY" \
+  -H "Content-Type: application/json" \
+  -d '{"fan":"auto"}'
+
+
+============================================================
+13. MODE AND FAN CODES USED BY THE TESTED AIRBASE
+============================================================
+
+The Worker internally translates:
+
+Heat = 1
+Cool = 2
+Dry  = 7
+
+Fan:
+
+Auto   = 0
+Low    = 1
+Medium = 3
+High   = 5
+
+The dashboard user does not need to enter these numeric values.
+
+
+============================================================
+14. TEMPERATURE LIMITS
+============================================================
+
+The supplied generic Worker uses the limits observed on the tested
+Airbase system:
+
+Heating:
+16-31°C
+
+Cooling:
+23-32°C
+
+Dry:
+No temperature setpoint
+
+If your own model reports different limits, the code may need to be
+adapted.
+
+
+============================================================
+15. TROUBLESHOOTING
+============================================================
+
+HEALTH WORKS BUT STATUS FAILS
+-----------------------------
+Check:
+
+AIRBASE_ID
+AIRBASE_PASSWORD
+AIRBASE_PORT
+AIRBASE_DEVICE
+
+Also confirm that the Airbase account can currently control the unit.
+
+
+401 UNAUTHORISED
+----------------
+The DAIKIN_API_KEY used by the browser or curl command does not match
+the Cloudflare secret.
+
+
+MISSING CLOUDFLARE BINDING
+--------------------------
+If the response says something similar to:
+
+Missing Cloudflare binding: AIRBASE_DEVICE
+
+check the exact variable names in Cloudflare.
+
+
+SCHEDULES DO NOT RUN
+--------------------
+Check:
+
+1. The DAIKIN_CONFIG KV binding exists.
+
+2. The Cron Trigger is:
+
+   * * * * *
+
+3. TIMEZONE is correct.
+
+4. At least one day is selected in the schedule.
+
+5. The schedule is enabled.
+
+
+DASHBOARD OPENS BUT SHOWS NO LIVE DATA
+--------------------------------------
+Open the Diagnostics panel. It will display the most recent API error
+or response.
+
+
+============================================================
+16. SECURITY
+============================================================
+
+The browser dashboard itself is publicly reachable at the Worker URL,
+but controller operations require the DAIKIN_API_KEY.
+
+The API key is stored in browser localStorage after the user presses
+"Save key".
+
+Keep these values private:
+
+AIRBASE_PASSWORD
+DAIKIN_API_KEY
+
+Cloudflare secrets should be used rather than hard-coding them inside
+the Worker source.
+
+
+============================================================
+17. WHAT THIS GENERIC VERSION DOES NOT INCLUDE
+============================================================
+
+This distribution intentionally excludes the customised solar-control
+system.
+
+It does NOT contain:
+
+- solar generation inputs
+- battery state inputs
+- excess-solar calculations
+- Solcast integration
+- solar start/stop thresholds
+- solar pre-start
+- solar automation ownership
+- pricing-system integration
+- Deye integration
+
+The generic Worker is therefore a standalone Daikin Airbase cloud
+controller with manual control and weekly scheduling only.
