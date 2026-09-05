@@ -1,0 +1,1913 @@
+// Generic Daikin Airbase Cloudflare Worker controller
+// Solar automation intentionally NOT included.
+//
+// Required Cloudflare secrets / variables:
+//   AIRBASE_ID
+//   AIRBASE_PASSWORD
+//   AIRBASE_PORT
+//   AIRBASE_DEVICE
+//   DAIKIN_API_KEY
+//
+// Required KV binding:
+//   DAIKIN_CONFIG
+//
+// Recommended variable:
+//   TIMEZONE   e.g. Pacific/Auckland, Australia/Sydney, Europe/London
+//
+// Required cron trigger for schedules:
+//   * * * * *
+
+const BASE = "https://dascontroller.com/skyfi/aircon";
+const CONFIG_KEY = "config";
+
+const MODE = { heat: "1", cool: "2", dry: "7" };
+const MODE_R = { "1": "heat", "2": "cool", "7": "dry" };
+
+const FAN = { auto: "0", low: "1", medium: "3", high: "5" };
+const FAN_R = { "0": "auto", "1": "low", "3": "medium", "5": "high" };
+
+const DEFAULT_CONFIG = {
+  schedules: [],
+  schedulesDisabled: false,
+};
+
+function num(v, fallback = null) {
+  const n = Number(v);
+  return Number.isFinite(n) ? n : fallback;
+}
+
+function clamp(n, min, max) {
+  return Math.min(max, Math.max(min, n));
+}
+
+function timezone(env) {
+  return env.TIMEZONE || "Pacific/Auckland";
+}
+
+function json(value, status = 200) {
+  return new Response(JSON.stringify(value, null, 2), {
+    status,
+    headers: {
+      "Content-Type": "application/json",
+      "Cache-Control": "no-store",
+      "Access-Control-Allow-Origin": "*",
+    },
+  });
+}
+
+function authorised(request, env) {
+  return (
+    (request.headers.get("Authorization") || "") ===
+    `Bearer ${env.DAIKIN_API_KEY}`
+  );
+}
+
+async function readJson(request) {
+  try {
+    return { ok: true, value: await request.json() };
+  } catch {
+    return { ok: false };
+  }
+}
+
+function parseCSV(text) {
+  const out = {};
+  for (const part of String(text || "").trim().split(",")) {
+    const i = part.indexOf("=");
+    if (i >= 0) {
+      out[part.slice(0, i).trim()] = part.slice(i + 1).trim();
+    }
+  }
+  return out;
+}
+
+function day3(value) {
+  const d = String(value || "").trim().toLowerCase().slice(0, 3);
+  return ["mon", "tue", "wed", "thu", "fri", "sat", "sun"].includes(d)
+    ? d
+    : null;
+}
+
+function normaliseDays(value) {
+  return Array.isArray(value)
+    ? [...new Set(value.map(day3).filter(Boolean))]
+    : [];
+}
+
+function normaliseAction(schedule) {
+  const action = schedule?.action || {};
+
+  if (action.type === "off") {
+    return { type: "off" };
+  }
+
+  const mode = ["heat", "cool", "dry"].includes(action.mode)
+    ? action.mode
+    : "heat";
+
+  const fan = ["auto", "low", "medium", "high"].includes(action.fan)
+    ? action.fan
+    : "auto";
+
+  const result = {
+    type: "on",
+    mode,
+    fan,
+  };
+
+  if (mode !== "dry") {
+    const t = num(action.temperature, 23);
+    result.temperature =
+      mode === "cool"
+        ? clamp(t, 23, 32)
+        : clamp(t, 16, 31);
+  }
+
+  return result;
+}
+
+function normaliseSchedule(schedule, index = 0) {
+  return {
+    id: String(
+      schedule?.id ||
+        `schedule-${Date.now()}-${index}`
+    ),
+    enabled: schedule?.enabled !== false,
+    days: normaliseDays(schedule?.days),
+    time: /^([01]\d|2[0-3]):([0-5]\d)$/.test(
+      String(schedule?.time || "")
+    )
+      ? String(schedule.time)
+      : "08:00",
+    action: normaliseAction(schedule),
+  };
+}
+
+async function getConfig(env) {
+  let stored = null;
+
+  try {
+    stored = await env.DAIKIN_CONFIG.get(CONFIG_KEY, {
+      type: "json",
+    });
+  } catch {}
+
+  return {
+    ...DEFAULT_CONFIG,
+    ...(stored || {}),
+    schedules: Array.isArray(stored?.schedules)
+      ? stored.schedules.map(normaliseSchedule)
+      : [],
+    schedulesDisabled: stored?.schedulesDisabled === true,
+  };
+}
+
+async function saveConfig(env, config) {
+  const clean = {
+    schedules: Array.isArray(config?.schedules)
+      ? config.schedules.map(normaliseSchedule)
+      : [],
+    schedulesDisabled: config?.schedulesDisabled === true,
+  };
+
+  await env.DAIKIN_CONFIG.put(
+    CONFIG_KEY,
+    JSON.stringify(clean)
+  );
+
+  return clean;
+}
+
+function airbaseParams(env) {
+  for (const key of [
+    "AIRBASE_ID",
+    "AIRBASE_PASSWORD",
+    "AIRBASE_PORT",
+    "AIRBASE_DEVICE",
+  ]) {
+    if (!env[key]) {
+      throw new Error(`Missing Cloudflare binding: ${key}`);
+    }
+  }
+
+  return {
+    id: env.AIRBASE_ID,
+    spw: env.AIRBASE_PASSWORD,
+    port: env.AIRBASE_PORT,
+    device: env.AIRBASE_DEVICE,
+  };
+}
+
+async function airGet(env, endpoint, extra = {}) {
+  const url = new URL(`${BASE}/${endpoint}`);
+
+  for (const [key, value] of Object.entries({
+    ...airbaseParams(env),
+    ...extra,
+  })) {
+    if (value != null) {
+      url.searchParams.set(key, String(value));
+    }
+  }
+
+  const response = await fetch(url.toString());
+  const text = await response.text();
+
+  if (!response.ok) {
+    throw new Error(
+      `${endpoint} HTTP ${response.status}: ${text}`
+    );
+  }
+
+  const parsed = parseCSV(text);
+
+  if (
+    parsed.ret &&
+    !["OK", "ok", "0"].includes(String(parsed.ret))
+  ) {
+    throw new Error(`${endpoint}: ${text}`);
+  }
+
+  return parsed;
+}
+
+const getControl = (env) =>
+  airGet(env, "get_control_info");
+
+const getSensors = (env) =>
+  airGet(env, "get_sensor_info");
+
+const getModel = (env) =>
+  airGet(env, "get_model_info");
+
+async function setControl(env, state) {
+  const url = new URL(`${BASE}/set_control_info`);
+
+  const all = {
+    ...airbaseParams(env),
+    ...state,
+  };
+
+  delete all.ret;
+
+  for (const [key, value] of Object.entries(all)) {
+    if (value == null || value === "") continue;
+
+    if (/^[A-Za-z0-9_]+$/.test(key)) {
+      url.searchParams.set(key, String(value));
+    }
+  }
+
+  const response = await fetch(url.toString());
+  const text = await response.text();
+
+  if (!response.ok) {
+    throw new Error(
+      `set_control_info HTTP ${response.status}: ${text}`
+    );
+  }
+
+  const parsed = parseCSV(text);
+
+  if (
+    parsed.ret &&
+    !["OK", "ok", "0"].includes(String(parsed.ret))
+  ) {
+    throw new Error(`set_control_info: ${text}`);
+  }
+
+  return parsed;
+}
+
+// Airbase is safest when writes include the full current control state.
+// Read the current state, change only the requested field, send it back,
+// then read once more to confirm the new state.
+async function modifyControl(env, changes) {
+  const before = await getControl(env);
+
+  const full = {
+    ...before,
+    ...changes,
+  };
+
+  delete full.ret;
+
+  await setControl(env, full);
+
+  const after = await getControl(env);
+
+  return {
+    before,
+    after,
+  };
+}
+
+function publicControl(data) {
+  return {
+    power: String(data?.pow) === "1",
+    mode:
+      MODE_R[String(data?.mode)] ||
+      data?.mode ||
+      null,
+    setpoint:
+      data?.stemp == null || data.stemp === ""
+        ? null
+        : num(data.stemp, null),
+    fan:
+      FAN_R[String(data?.f_rate)] ||
+      data?.f_rate ||
+      null,
+    raw: data || {},
+  };
+}
+
+function publicSensors(data) {
+  return {
+    indoorTemperature:
+      data?.htemp == null || data.htemp === ""
+        ? null
+        : num(data.htemp, null),
+    outdoorTemperature:
+      data?.otemp == null || data.otemp === ""
+        ? null
+        : num(data.otemp, null),
+    raw: data || {},
+  };
+}
+
+function localParts(env, date = new Date()) {
+  const parts = new Intl.DateTimeFormat("en-NZ", {
+    timeZone: timezone(env),
+    year: "numeric",
+    month: "2-digit",
+    day: "2-digit",
+    weekday: "short",
+    hour: "2-digit",
+    minute: "2-digit",
+    hourCycle: "h23",
+  }).formatToParts(date);
+
+  const get = (type) =>
+    parts.find((x) => x.type === type)?.value || "";
+
+  const weekdayMap = {
+    Mon: "mon",
+    Tue: "tue",
+    Wed: "wed",
+    Thu: "thu",
+    Fri: "fri",
+    Sat: "sat",
+    Sun: "sun",
+  };
+
+  const hour = Number(get("hour"));
+  const minute = Number(get("minute"));
+
+  return {
+    day:
+      weekdayMap[get("weekday")] ||
+      day3(get("weekday")),
+    time:
+      `${String(hour).padStart(2, "0")}:` +
+      `${String(minute).padStart(2, "0")}`,
+    dateKey:
+      `${get("year")}-${get("month")}-${get("day")}`,
+  };
+}
+
+function scheduleMatches(env, schedule, date) {
+  const local = localParts(env, date);
+
+  return (
+    schedule?.enabled === true &&
+    normaliseDays(schedule.days).includes(local.day) &&
+    String(schedule.time) === local.time
+  );
+}
+
+async function applySchedule(env, schedule) {
+  const action = normaliseAction(schedule);
+
+  if (action.type === "off") {
+    return modifyControl(env, {
+      pow: "0",
+    });
+  }
+
+  const changes = {
+    pow: "1",
+    mode: MODE[action.mode],
+    f_rate: FAN[action.fan],
+  };
+
+  if (action.mode !== "dry") {
+    changes.stemp = String(action.temperature);
+  }
+
+  return modifyControl(env, changes);
+}
+
+async function runSchedules(env, timestamp = Date.now()) {
+  const config = await getConfig(env);
+  const date = new Date(timestamp);
+  const local = localParts(env, date);
+
+  if (config.schedulesDisabled === true) {
+    return;
+  }
+
+  for (const schedule of config.schedules) {
+    if (!scheduleMatches(env, schedule, date)) {
+      continue;
+    }
+
+    const executionKey =
+      `schedule-executed:${local.dateKey}:` +
+      `${schedule.id}:${schedule.time}`;
+
+    if (await env.DAIKIN_CONFIG.get(executionKey)) {
+      continue;
+    }
+
+    await applySchedule(env, schedule);
+
+    await env.DAIKIN_CONFIG.put(
+      executionKey,
+      String(timestamp),
+      { expirationTtl: 172800 }
+    );
+  }
+}
+
+function ui() {
+  return `<!doctype html>
+<html>
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>Daikin Airbase Controller</title>
+<style>
+:root{
+  --bg:#eef3f7;
+  --text:#172033;
+  --muted:#667085;
+  --line:#dfe7ee;
+  --primary:#175cd3;
+  --primary-dark:#1849a9;
+  --shadow:0 8px 24px rgba(16,24,40,.07);
+}
+*{box-sizing:border-box}
+body{
+  font-family:system-ui,-apple-system,BlinkMacSystemFont,"Segoe UI",sans-serif;
+  background:
+    radial-gradient(circle at top right,rgba(23,92,211,.08),transparent 28rem),
+    linear-gradient(180deg,#f7f9fc 0,#eef3f7 100%);
+  color:var(--text);
+  margin:0;
+  padding:24px 16px 48px;
+}
+.w{max-width:980px;margin:auto}
+.hero{
+  background:linear-gradient(135deg,#132c4f,#175cd3);
+  color:#fff;
+  border-radius:20px;
+  padding:22px 24px;
+  margin-bottom:18px;
+  box-shadow:0 12px 30px rgba(23,92,211,.18);
+}
+.hero h1{font-size:1.65rem;margin:0 0 4px}
+.hero p{margin:0;color:rgba(255,255,255,.78);font-size:.9rem}
+.c,details.panel{
+  background:rgba(255,255,255,.96);
+  border:1px solid var(--line);
+  border-radius:16px;
+  margin:0 0 14px;
+  box-shadow:var(--shadow);
+}
+.c{padding:18px}
+h2{font-size:1.08rem;margin-top:0}
+.g{
+  display:grid;
+  grid-template-columns:repeat(auto-fit,minmax(145px,1fr));
+  gap:11px;
+}
+.m{
+  border:1px solid #e5e9ef;
+  border-radius:12px;
+  padding:12px;
+  background:linear-gradient(180deg,#fff,#fafcff);
+}
+.l{
+  font-size:.76rem;
+  color:var(--muted);
+  font-weight:600;
+}
+.v{
+  font-size:1.3rem;
+  font-weight:700;
+  margin-top:2px;
+}
+input,select,button{
+  font:inherit;
+  width:100%;
+  padding:9px 10px;
+  border:1px solid #cfd7df;
+  border-radius:9px;
+  background:#fff;
+}
+input:focus,select:focus{
+  outline:2px solid rgba(23,92,211,.18);
+  border-color:#84adff;
+}
+button{
+  cursor:pointer;
+  transition:transform .12s ease,box-shadow .12s ease;
+}
+button:hover:not(:disabled){
+  transform:translateY(-1px);
+  box-shadow:0 4px 10px rgba(16,24,40,.08);
+}
+button:disabled{
+  opacity:.6;
+  cursor:default;
+}
+.p{
+  background:linear-gradient(180deg,var(--primary),var(--primary-dark));
+  color:#fff;
+  border-color:var(--primary-dark);
+}
+.r{
+  display:grid;
+  grid-template-columns:repeat(auto-fit,minmax(145px,1fr));
+  gap:9px;
+  margin-top:10px;
+}
+label{
+  font-size:.84rem;
+  display:block;
+  margin:6px 0 4px;
+}
+.s{
+  border:1px solid #e5e9ef;
+  border-radius:11px;
+  padding:11px;
+  margin-top:9px;
+  background:#fbfcfe;
+}
+.days{
+  display:grid;
+  grid-template-columns:repeat(7,1fr);
+  gap:3px;
+}
+.days label{
+  display:flex;
+  justify-content:center;
+  align-items:center;
+  gap:2px;
+  font-size:.72rem;
+}
+.days input{width:auto}
+.hide{display:none}
+.status{
+  white-space:pre-wrap;
+  overflow-wrap:anywhere;
+  background:#f7f9fb;
+  padding:10px;
+  border-radius:9px;
+  font-size:.8rem;
+  border:1px solid #edf1f5;
+}
+.muted{
+  color:var(--muted);
+  font-size:.82rem;
+}
+.feedback{
+  margin-top:10px;
+  padding:9px 11px;
+  border-radius:8px;
+  font-size:.84rem;
+  display:none;
+}
+.feedback.show{display:block}
+.feedback.ok{
+  background:#ecfdf3;
+  border:1px solid #abefc6;
+  color:#067647;
+}
+.feedback.busy{
+  background:#eff8ff;
+  border:1px solid #b2ddff;
+  color:#175cd3;
+}
+.feedback.err{
+  background:#fef3f2;
+  border:1px solid #fecdca;
+  color:#b42318;
+}
+
+.live-controls{
+  display:grid;
+  grid-template-columns:repeat(4,minmax(0,1fr));
+  gap:11px;
+  margin-top:11px;
+}
+.control-tile{
+  border:1px solid #d9e2ec;
+  border-radius:14px;
+  background:linear-gradient(180deg,#fff,#f8fbff);
+  padding:13px;
+  min-height:94px;
+  text-align:left;
+  width:100%;
+  color:var(--text);
+}
+.control-tile .v{font-size:1.28rem}
+.control-tile.interactive:hover{border-color:#84adff}
+.setpoint-control{
+  display:grid;
+  grid-template-columns:44px 1fr 44px;
+  align-items:center;
+  gap:7px;
+  margin-top:6px;
+}
+.setpoint-control button{
+  padding:8px 4px;
+  font-size:1.25rem;
+  font-weight:700;
+  min-height:40px;
+}
+.setpoint-value{
+  text-align:center;
+  font-size:1.3rem;
+  font-weight:750;
+}
+.schedule-master{
+  display:flex;
+  align-items:center;
+  justify-content:space-between;
+  gap:12px;
+  border:1px solid #fedf89;
+  background:#fffaeb;
+  border-radius:12px;
+  padding:12px 13px;
+  margin-bottom:14px;
+}
+.schedule-master label{
+  display:flex;
+  align-items:center;
+  gap:9px;
+  margin:0;
+  font-weight:700;
+}
+.schedule-master input{width:auto}
+button.changed{
+  outline:2px solid #12b76a;
+  outline-offset:2px;
+}
+
+details.panel{overflow:hidden}
+details.panel summary{
+  list-style:none;
+  cursor:pointer;
+  padding:15px 18px;
+  font-size:1.02rem;
+  font-weight:700;
+  display:flex;
+  align-items:center;
+  justify-content:space-between;
+  user-select:none;
+}
+details.panel summary::-webkit-details-marker{
+  display:none;
+}
+details.panel summary::after{
+  content:"＋";
+  color:var(--primary);
+  font-size:1.25rem;
+}
+details.panel[open] summary::after{
+  content:"−";
+}
+details.panel[open] summary{
+  border-bottom:1px solid #edf1f5;
+  background:#fbfcfe;
+}
+.panel-body{
+  padding:16px 18px 18px;
+}
+.summary-note{
+  color:var(--muted);
+  font-size:.78rem;
+  font-weight:500;
+  margin-left:auto;
+  margin-right:12px;
+}
+@media(max-width:600px){
+  body{padding:10px 8px 28px}
+  .w{max-width:100%}
+  .hero{padding:16px;border-radius:15px;margin-bottom:11px}
+  .hero h1{font-size:1.35rem}
+  .c,details.panel{border-radius:13px;margin-bottom:10px}
+  .c{padding:13px}
+  .panel-body{padding:13px}
+  .g{grid-template-columns:repeat(2,minmax(0,1fr));gap:8px}
+  .live-controls{grid-template-columns:repeat(2,minmax(0,1fr));gap:8px}
+  .control-tile{min-height:88px;padding:11px}
+  .r{grid-template-columns:1fr}
+  .days{grid-template-columns:repeat(4,1fr);row-gap:7px}
+  .summary-note{display:none}
+  button,input,select{min-height:42px}
+  .schedule-master{align-items:flex-start}
+}
+@media(max-width:380px){
+  .g,.live-controls{grid-template-columns:1fr}
+}
+</style>
+</head>
+<body>
+<div class="w">
+
+<div class="hero">
+  <h1>Daikin Airbase Controller</h1>
+  <p>Cloud control and weekly scheduling</p>
+</div>
+
+<details class="panel">
+  <summary>
+    API access
+    <span class="summary-note">Dashboard authentication</span>
+  </summary>
+  <div class="panel-body">
+    <label>Controller API key</label>
+    <input id="key" type="password">
+    <div class="r">
+      <button class="p" onclick="saveKey()">Save key</button>
+      <button onclick="refreshAll()">Refresh</button>
+    </div>
+  </div>
+</details>
+
+<div class="c">
+  <h2>Live status &amp; control</h2>
+
+  <div class="g">
+    <div class="m">
+      <div class="l">Indoor</div>
+      <div class="v" id="indoor">—</div>
+    </div>
+
+    <div class="m">
+      <div class="l">Outdoor</div>
+      <div class="v" id="outdoor">—</div>
+    </div>
+  </div>
+
+  <div class="live-controls">
+    <button id="powerTile" class="control-tile interactive" onclick="togglePower()">
+      <div class="l">Power · tap to toggle</div>
+      <div class="v" id="power">—</div>
+    </button>
+
+    <button id="modeTile" class="control-tile interactive" onclick="cycleMode()">
+      <div class="l">Mode · tap to cycle</div>
+      <div class="v" id="modeV">—</div>
+    </button>
+
+    <div class="control-tile">
+      <div class="l">Setpoint</div>
+      <div class="setpoint-control">
+        <button id="tempDown" onclick="adjustTemp(-1)">−</button>
+        <div class="setpoint-value" id="tempV">—</div>
+        <button id="tempUp" onclick="adjustTemp(1)">+</button>
+      </div>
+    </div>
+
+    <button id="fanTile" class="control-tile interactive" onclick="cycleFan()">
+      <div class="l">Fan · tap to cycle</div>
+      <div class="v" id="fanV">—</div>
+    </button>
+  </div>
+
+  <div id="liveFeedback" class="feedback"></div>
+</div>
+<details class="panel">
+  <summary>
+    Schedules
+    <span class="summary-note">Weekly ON/OFF rules</span>
+  </summary>
+
+  <div class="panel-body">
+    <div class="schedule-master">
+      <label>
+        <input id="disableSchedules" type="checkbox">
+        Disable all schedules
+      </label>
+      <span id="scheduleMasterState" class="muted">Schedules active</span>
+    </div>
+
+    <div id="schedules"></div>
+
+    <div class="r">
+      <button onclick="addSchedule()">Add schedule</button>
+      <button
+        id="saveSchedulesBtn"
+        class="p"
+        onclick="saveSchedules()"
+      >
+        Save schedules
+      </button>
+    </div>
+
+    <div
+      id="scheduleFeedback"
+      class="feedback"
+    ></div>
+  </div>
+</details>
+
+<details class="panel">
+  <summary>
+    Diagnostics
+    <span class="summary-note">Technical response</span>
+  </summary>
+
+  <div class="panel-body">
+    <div id="msg" class="status">Ready</div>
+  </div>
+</details>
+
+</div>
+
+<script>
+const $ = (id) => document.getElementById(id);
+let cfg = { schedules: [], schedulesDisabled: false };
+let liveState = {
+  power: null,
+  mode: null,
+  setpoint: null,
+  fan: null,
+};
+let liveBusy = false;
+
+function K(){
+  return localStorage.getItem("daikinApiKey") || "";
+}
+
+function msg(value){
+  $("msg").textContent =
+    typeof value === "string"
+      ? value
+      : JSON.stringify(value, null, 2);
+}
+
+function feedback(id, text, type = "ok"){
+  const element = $(id);
+  if (!element) return;
+
+  element.textContent = text;
+  element.className = "feedback show " + type;
+
+  if (type === "ok"){
+    setTimeout(() => {
+      element.className = "feedback";
+    }, 3500);
+  }
+}
+
+function buttonBusy(id, busy, busyText, normalText){
+  const button = $(id);
+  if (!button) return;
+
+  button.disabled = busy;
+  button.textContent =
+    busy ? busyText : normalText;
+}
+
+async function api(path, options = {}){
+  const headers = {
+    ...(options.headers || {}),
+    Authorization: "Bearer " + K(),
+  };
+
+  if (options.body){
+    headers["Content-Type"] = "application/json";
+  }
+
+  const response = await fetch(path, {
+    ...options,
+    headers,
+  });
+
+  const text = await response.text();
+
+  let data;
+  try {
+    data = JSON.parse(text);
+  } catch {
+    data = { raw: text };
+  }
+
+  if (!response.ok){
+    throw new Error(
+      data?.error ||
+      text ||
+      ("HTTP " + response.status)
+    );
+  }
+
+  return data;
+}
+
+function saveKey(){
+  localStorage.setItem(
+    "daikinApiKey",
+    $("key").value.trim()
+  );
+
+  feedback(
+    "powerFeedback",
+    "API key saved in this browser.",
+    "ok"
+  );
+
+  refreshAll(false);
+}
+
+function pretty(value){
+  if (value == null) return "—";
+  const s = String(value);
+  return s.charAt(0).toUpperCase() + s.slice(1);
+}
+
+function updateTempButtons(){
+  const down = $("tempDown");
+  const up = $("tempUp");
+
+  if (!down || !up) return;
+
+  const temperature = Number(liveState.setpoint);
+
+  if (
+    liveState.mode === "dry" ||
+    !Number.isFinite(temperature)
+  ){
+    down.disabled = true;
+    up.disabled = true;
+    return;
+  }
+
+  const min =
+    liveState.mode === "cool" ? 23 : 16;
+
+  const max =
+    liveState.mode === "cool" ? 32 : 31;
+
+  down.disabled =
+    liveBusy || temperature <= min;
+
+  up.disabled =
+    liveBusy || temperature >= max;
+}
+
+async function live(){
+  const data = await api("/status");
+
+  $("indoor").textContent =
+    data.sensors.indoorTemperature == null
+      ? "—"
+      : data.sensors.indoorTemperature + "°C";
+
+  $("outdoor").textContent =
+    data.sensors.outdoorTemperature == null
+      ? "—"
+      : data.sensors.outdoorTemperature + "°C";
+
+  liveState = {
+    power: data.control.power === true,
+    mode: data.control.mode || null,
+    setpoint: data.control.setpoint,
+    fan: data.control.fan || null,
+  };
+
+  $("power").textContent =
+    liveState.power ? "ON" : "OFF";
+
+  $("modeV").textContent =
+    pretty(liveState.mode);
+
+  $("tempV").textContent =
+    liveState.setpoint == null
+      ? "—"
+      : liveState.setpoint + "°C";
+
+  $("fanV").textContent =
+    pretty(liveState.fan);
+
+  updateTempButtons();
+
+  return data;
+}
+
+async function liveCommand(path, payload, successMessage){
+  if (liveBusy) return;
+
+  liveBusy = true;
+  updateTempButtons();
+
+  feedback(
+    "liveFeedback",
+    "Sending command…",
+    "busy"
+  );
+
+  for (const id of [
+    "powerTile",
+    "modeTile",
+    "fanTile",
+  ]){
+    if ($(id)) $(id).disabled = true;
+  }
+
+  try {
+    const result = await api(path, {
+      method: "POST",
+      body: JSON.stringify(payload),
+    });
+
+    msg(result);
+    await live();
+
+    feedback(
+      "liveFeedback",
+      successMessage + " Confirmed by Daikin.",
+      "ok"
+    );
+  } catch (error){
+    feedback(
+      "liveFeedback",
+      error.message,
+      "err"
+    );
+
+    msg(error.message);
+
+    await live().catch(() => {});
+  } finally {
+    liveBusy = false;
+
+    for (const id of [
+      "powerTile",
+      "modeTile",
+      "fanTile",
+    ]){
+      if ($(id)) $(id).disabled = false;
+    }
+
+    updateTempButtons();
+  }
+}
+
+async function togglePower(){
+  if (liveState.power == null) return;
+
+  const on = !liveState.power;
+
+  await liveCommand(
+    "/power",
+    { on },
+    on ? "Power ON." : "Power OFF."
+  );
+}
+
+async function cycleMode(){
+  const modes = ["heat", "cool", "dry"];
+  const currentIndex =
+    modes.indexOf(liveState.mode);
+
+  const next =
+    modes[
+      currentIndex >= 0
+        ? (currentIndex + 1) % modes.length
+        : 0
+    ];
+
+  await liveCommand(
+    "/mode",
+    { mode: next },
+    "Mode changed to " + pretty(next) + "."
+  );
+}
+
+async function cycleFan(){
+  const fans = [
+    "auto",
+    "low",
+    "medium",
+    "high",
+  ];
+
+  const currentIndex =
+    fans.indexOf(liveState.fan);
+
+  const next =
+    fans[
+      currentIndex >= 0
+        ? (currentIndex + 1) % fans.length
+        : 0
+    ];
+
+  await liveCommand(
+    "/fan",
+    { fan: next },
+    "Fan changed to " + pretty(next) + "."
+  );
+}
+
+async function adjustTemp(delta){
+  if (
+    liveBusy ||
+    liveState.mode === "dry"
+  ){
+    return;
+  }
+
+  const current =
+    Number(liveState.setpoint);
+
+  if (!Number.isFinite(current)) return;
+
+  const min =
+    liveState.mode === "cool" ? 23 : 16;
+
+  const max =
+    liveState.mode === "cool" ? 32 : 31;
+
+  const next =
+    Math.min(
+      max,
+      Math.max(min, current + delta)
+    );
+
+  if (next === current) return;
+
+  await liveCommand(
+    "/setpoint",
+    { temperature: next },
+    "Setpoint changed to " + next + "°C."
+  );
+}
+
+function scheduleRow(schedule = {}){
+  return {
+    id:
+      schedule.id ||
+      (
+        "schedule-" +
+        Date.now() +
+        "-" +
+        Math.random().toString(36).slice(2, 6)
+      ),
+    enabled: schedule.enabled !== false,
+    days: Array.isArray(schedule.days)
+      ? schedule.days
+      : [],
+    time: schedule.time || "08:00",
+    action:
+      schedule.action ||
+      {
+        type: "on",
+        mode: "heat",
+        temperature: 23,
+        fan: "auto",
+      },
+  };
+}
+
+function addSchedule(){
+  cfg.schedules = cfg.schedules || [];
+  cfg.schedules.push(scheduleRow());
+  renderSchedules();
+}
+
+function deleteSchedule(id){
+  cfg.schedules =
+    (cfg.schedules || [])
+      .filter((item) => item.id !== id);
+
+  renderSchedules();
+}
+
+function typeChange(select){
+  const box = select.closest(".s");
+  const onFields = box.querySelector(".onfields");
+
+  onFields.classList.toggle(
+    "hide",
+    select.value === "off"
+  );
+}
+
+function modeChange(select){
+  const box = select.closest(".s");
+  const tempField =
+    box.querySelector(".tempfield");
+
+  tempField.classList.toggle(
+    "hide",
+    select.value === "dry"
+  );
+}
+
+function renderScheduleMaster(){
+  const checkbox = $("disableSchedules");
+  const label = $("scheduleMasterState");
+
+  if (!checkbox || !label) return;
+
+  checkbox.checked =
+    cfg?.schedulesDisabled === true;
+
+  label.textContent =
+    cfg?.schedulesDisabled === true
+      ? "All schedules disabled"
+      : "Schedules active";
+}
+
+function renderSchedules(){
+  renderScheduleMaster();
+
+  const root = $("schedules");
+  root.innerHTML = "";
+
+  const schedules = cfg?.schedules || [];
+
+  if (!schedules.length){
+    root.innerHTML =
+      '<p class="muted">No schedules configured.</p>';
+    return;
+  }
+
+  for (const schedule of schedules){
+    const s = scheduleRow(schedule);
+    const action = s.action || {};
+    const selectedDays =
+      Array.isArray(s.days) ? s.days : [];
+
+    const element =
+      document.createElement("div");
+
+    element.className = "s";
+    element.dataset.id = s.id;
+
+    element.innerHTML =
+      '<div class="r">' +
+        '<label><input data-f="enabled" type="checkbox" ' +
+          (s.enabled ? "checked" : "") +
+          ' style="width:auto"> Enabled</label>' +
+        '<div><label>Time</label>' +
+          '<input data-f="time" type="time" value="' +
+          (s.time || "08:00") +
+          '"></div>' +
+        '<div><label>Action</label>' +
+          '<select data-f="type" onchange="typeChange(this)">' +
+            '<option value="on" ' +
+              (action.type === "on" ? "selected" : "") +
+              '>ON</option>' +
+            '<option value="off" ' +
+              (action.type === "off" ? "selected" : "") +
+              '>OFF</option>' +
+          '</select></div>' +
+      '</div>' +
+
+      '<div class="days">' +
+        ["mon","tue","wed","thu","fri","sat","sun"]
+          .map((day) =>
+            '<label><input data-day="' +
+            day +
+            '" type="checkbox" ' +
+            (selectedDays.includes(day) ? "checked" : "") +
+            '>' +
+            day.toUpperCase() +
+            '</label>'
+          )
+          .join("") +
+      '</div>' +
+
+      '<div class="r onfields ' +
+        (action.type === "off" ? "hide" : "") +
+        '">' +
+
+        '<div><label>Mode</label>' +
+          '<select data-f="mode" onchange="modeChange(this)">' +
+          ["heat","cool","dry"]
+            .map((mode) =>
+              '<option ' +
+              (action.mode === mode ? "selected" : "") +
+              '>' +
+              mode +
+              '</option>'
+            )
+            .join("") +
+          '</select></div>' +
+
+        '<div class="tempfield ' +
+          (action.mode === "dry" ? "hide" : "") +
+          '">' +
+          '<label>Temperature °C</label>' +
+          '<input data-f="temperature" type="number" value="' +
+          (action.temperature ?? 23) +
+          '">' +
+        '</div>' +
+
+        '<div><label>Fan</label>' +
+          '<select data-f="fan">' +
+          ["auto","low","medium","high"]
+            .map((fan) =>
+              '<option ' +
+              (action.fan === fan ? "selected" : "") +
+              '>' +
+              fan +
+              '</option>'
+            )
+            .join("") +
+          '</select></div>' +
+
+      '</div>' +
+
+      '<button onclick="deleteSchedule(\\'' +
+      s.id +
+      '\\')">Delete</button>';
+
+    root.appendChild(element);
+  }
+}
+
+function collectSchedules(){
+  return [
+    ...document.querySelectorAll(".s"),
+  ].map((element) => {
+    const type =
+      element.querySelector(
+        '[data-f="type"]'
+      ).value;
+
+    const base = {
+      id: element.dataset.id,
+      enabled:
+        element.querySelector(
+          '[data-f="enabled"]'
+        ).checked,
+      days: [
+        ...element.querySelectorAll(
+          "[data-day]"
+        ),
+      ]
+        .filter((checkbox) => checkbox.checked)
+        .map((checkbox) => checkbox.dataset.day),
+      time:
+        element.querySelector(
+          '[data-f="time"]'
+        ).value,
+    };
+
+    if (type === "off"){
+      return {
+        ...base,
+        action: { type: "off" },
+      };
+    }
+
+    const mode =
+      element.querySelector(
+        '[data-f="mode"]'
+      ).value;
+
+    const action = {
+      type: "on",
+      mode,
+      fan:
+        element.querySelector(
+          '[data-f="fan"]'
+        ).value,
+    };
+
+    if (mode !== "dry"){
+      action.temperature =
+        Number(
+          element.querySelector(
+            '[data-f="temperature"]'
+          ).value
+        );
+    }
+
+    return {
+      ...base,
+      action,
+    };
+  });
+}
+
+async function loadConfig(){
+  const data = await api("/config");
+  cfg = data.config;
+  renderSchedules();
+}
+
+async function saveSchedules(){
+  try {
+    buttonBusy(
+      "saveSchedulesBtn",
+      true,
+      "Saving…",
+      "Save schedules"
+    );
+
+    feedback(
+      "scheduleFeedback",
+      "Saving schedules…",
+      "busy"
+    );
+
+    const data = await api("/config", {
+      method: "PUT",
+      body: JSON.stringify({
+        schedules: collectSchedules(),
+        schedulesDisabled:
+          $("disableSchedules").checked,
+      }),
+    });
+
+    cfg = data.config;
+
+    feedback(
+      "scheduleFeedback",
+      "Schedules saved successfully.",
+      "ok"
+    );
+
+    msg(data);
+    renderSchedules();
+  } catch (error){
+    feedback(
+      "scheduleFeedback",
+      error.message,
+      "err"
+    );
+    msg(error.message);
+  } finally {
+    buttonBusy(
+      "saveSchedulesBtn",
+      false,
+      "",
+      "Save schedules"
+    );
+  }
+}
+
+async function refreshAll(showMessage = true){
+  if (!K()){
+    msg(
+      "Open API access and enter the controller API key."
+    );
+    return;
+  }
+
+  try {
+    await Promise.all([
+      live(),
+      loadConfig(),
+    ]);
+
+    if (showMessage){
+      msg("Updated.");
+    }
+  } catch (error){
+    msg(error.message);
+  }
+}
+
+$("key").value =
+  localStorage.getItem("daikinApiKey") || "";
+
+if (K()){
+  refreshAll(false);
+}
+
+setInterval(() => {
+  if (K()){
+    live().catch(() => {});
+  }
+}, 60000);
+</script>
+
+</body>
+</html>`;
+}
+
+export default {
+  async fetch(request, env) {
+    const url = new URL(request.url);
+
+    if (request.method === "OPTIONS") {
+      return new Response(null, {
+        status: 204,
+        headers: {
+          "Access-Control-Allow-Origin": "*",
+          "Access-Control-Allow-Methods":
+            "GET,POST,PUT,OPTIONS",
+          "Access-Control-Allow-Headers":
+            "Authorization,Content-Type",
+        },
+      });
+    }
+
+    try {
+      if (
+        url.pathname === "/" &&
+        request.method === "GET"
+      ) {
+        return new Response(ui(), {
+          headers: {
+            "Content-Type":
+              "text/html;charset=UTF-8",
+            "Cache-Control": "no-store",
+          },
+        });
+      }
+
+      if (
+        url.pathname === "/health" &&
+        request.method === "GET"
+      ) {
+        return json({
+          ok: true,
+          service: "daikin-airbase-controller",
+          now: new Date().toISOString(),
+          timezone: timezone(env),
+        });
+      }
+
+      if (!authorised(request, env)) {
+        return json(
+          {
+            ok: false,
+            error: "Unauthorised",
+          },
+          401
+        );
+      }
+
+      if (
+        url.pathname === "/status" &&
+        request.method === "GET"
+      ) {
+        const [control, sensors, model] =
+          await Promise.all([
+            getControl(env),
+            getSensors(env),
+            getModel(env).catch(() => null),
+          ]);
+
+        return json({
+          ok: true,
+          control: publicControl(control),
+          sensors: publicSensors(sensors),
+          model,
+        });
+      }
+
+      if (
+        url.pathname === "/sensors" &&
+        request.method === "GET"
+      ) {
+        return json({
+          ok: true,
+          ...publicSensors(
+            await getSensors(env)
+          ),
+        });
+      }
+
+      if (
+        url.pathname === "/power" &&
+        request.method === "POST"
+      ) {
+        const parsed = await readJson(request);
+
+        if (!parsed.ok) {
+          return json(
+            {
+              ok: false,
+              error: "Invalid JSON",
+            },
+            400
+          );
+        }
+
+        let on;
+
+        if (
+          typeof parsed.value?.on ===
+          "boolean"
+        ) {
+          on = parsed.value.on;
+        } else {
+          const value = String(
+            parsed.value?.power ??
+            parsed.value?.pow ??
+            ""
+          ).toLowerCase();
+
+          if (
+            ["1", "on", "true"].includes(
+              value
+            )
+          ) {
+            on = true;
+          }
+
+          if (
+            ["0", "off", "false"].includes(
+              value
+            )
+          ) {
+            on = false;
+          }
+        }
+
+        if (typeof on !== "boolean") {
+          return json(
+            {
+              ok: false,
+              error:
+                "Use {on:true} or {on:false}",
+            },
+            400
+          );
+        }
+
+        const result =
+          await modifyControl(env, {
+            pow: on ? "1" : "0",
+          });
+
+        return json({
+          ok: true,
+          control:
+            publicControl(result.after),
+        });
+      }
+
+      if (
+        url.pathname === "/mode" &&
+        request.method === "POST"
+      ) {
+        const parsed = await readJson(request);
+
+        if (!parsed.ok) {
+          return json(
+            {
+              ok: false,
+              error: "Invalid JSON",
+            },
+            400
+          );
+        }
+
+        const mode = String(
+          parsed.value?.mode || ""
+        ).toLowerCase();
+
+        if (!MODE[mode]) {
+          return json(
+            {
+              ok: false,
+              error:
+                "Mode must be heat, cool or dry",
+            },
+            400
+          );
+        }
+
+        const result =
+          await modifyControl(env, {
+            mode: MODE[mode],
+          });
+
+        return json({
+          ok: true,
+          control:
+            publicControl(result.after),
+        });
+      }
+
+      if (
+        url.pathname === "/setpoint" &&
+        request.method === "POST"
+      ) {
+        const parsed = await readJson(request);
+
+        if (!parsed.ok) {
+          return json(
+            {
+              ok: false,
+              error: "Invalid JSON",
+            },
+            400
+          );
+        }
+
+        const requested = num(
+          parsed.value?.temperature ??
+          parsed.value?.setpoint,
+          null
+        );
+
+        if (requested === null) {
+          return json(
+            {
+              ok: false,
+              error:
+                "temperature must be numeric",
+            },
+            400
+          );
+        }
+
+        const current =
+          await getControl(env);
+
+        const mode =
+          MODE_R[String(current.mode)] ||
+          "heat";
+
+        if (mode === "dry") {
+          return json(
+            {
+              ok: false,
+              error:
+                "Dry mode has no temperature setpoint",
+            },
+            400
+          );
+        }
+
+        const temperature =
+          mode === "cool"
+            ? clamp(requested, 23, 32)
+            : clamp(requested, 16, 31);
+
+        const result =
+          await modifyControl(env, {
+            stemp: String(temperature),
+          });
+
+        return json({
+          ok: true,
+          requestedTemperature:
+            requested,
+          appliedTemperature:
+            temperature,
+          control:
+            publicControl(result.after),
+        });
+      }
+
+      if (
+        url.pathname === "/fan" &&
+        request.method === "POST"
+      ) {
+        const parsed = await readJson(request);
+
+        if (!parsed.ok) {
+          return json(
+            {
+              ok: false,
+              error: "Invalid JSON",
+            },
+            400
+          );
+        }
+
+        const fan = String(
+          parsed.value?.fan || ""
+        ).toLowerCase();
+
+        if (!FAN[fan]) {
+          return json(
+            {
+              ok: false,
+              error:
+                "Fan must be auto, low, medium or high",
+            },
+            400
+          );
+        }
+
+        const result =
+          await modifyControl(env, {
+            f_rate: FAN[fan],
+          });
+
+        return json({
+          ok: true,
+          control:
+            publicControl(result.after),
+        });
+      }
+
+      if (
+        url.pathname === "/config" &&
+        request.method === "GET"
+      ) {
+        return json({
+          ok: true,
+          config: await getConfig(env),
+        });
+      }
+
+      if (
+        url.pathname === "/config" &&
+        ["POST", "PUT"].includes(
+          request.method
+        )
+      ) {
+        const parsed = await readJson(request);
+
+        if (!parsed.ok) {
+          return json(
+            {
+              ok: false,
+              error: "Invalid JSON",
+            },
+            400
+          );
+        }
+
+        const current =
+          await getConfig(env);
+
+        const incoming =
+          parsed.value || {};
+
+        const merged = {
+          ...current,
+          ...incoming,
+          schedules:
+            incoming.schedules === undefined
+              ? current.schedules
+              : incoming.schedules,
+        };
+
+        return json({
+          ok: true,
+          config:
+            await saveConfig(
+              env,
+              merged
+            ),
+        });
+      }
+
+      return json(
+        {
+          ok: false,
+          error: "Not found",
+          path: url.pathname,
+        },
+        404
+      );
+    } catch (error) {
+      console.log(
+        "Daikin Worker error:",
+        error instanceof Error
+          ? error.stack || error.message
+          : String(error)
+      );
+
+      return json(
+        {
+          ok: false,
+          error:
+            error instanceof Error
+              ? error.message
+              : String(error),
+        },
+        500
+      );
+    }
+  },
+
+  async scheduled(event, env, ctx) {
+    ctx.waitUntil(
+      runSchedules(
+        env,
+        Number.isFinite(
+          event?.scheduledTime
+        )
+          ? event.scheduledTime
+          : Date.now()
+      )
+    );
+  },
+};
