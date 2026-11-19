@@ -699,6 +699,14 @@ function normaliseAction(schedule) {
   return result;
 }
 
+function normaliseMonths(months) {
+  if (!Array.isArray(months)) return [];
+
+  return [...new Set(months.filter(
+    month => Number.isInteger(month) && month >= 1 && month <= 12
+  ))].sort((a, b) => a - b);
+}
+
 function normaliseSchedule(schedule, index = 0) {
   return {
     id: String(
@@ -707,6 +715,7 @@ function normaliseSchedule(schedule, index = 0) {
     ),
     enabled: schedule?.enabled !== false,
     days: normaliseDays(schedule?.days),
+    months: normaliseMonths(schedule?.months),
     time: /^([01]\d|2[0-3]):([0-5]\d)$/.test(
       String(schedule?.time || "")
     )
@@ -943,17 +952,19 @@ function localParts(env, date = new Date()) {
     time:
       `${String(hour).padStart(2, "0")}:` +
       `${String(minute).padStart(2, "0")}`,
+    month: Number(get("month")),
     dateKey:
       `${get("year")}-${get("month")}-${get("day")}`,
   };
 }
 
-function scheduleMatches(env, schedule, date) {
-  const local = localParts(env, date);
+function scheduleMatches(schedule, local) {
+  const months = normaliseMonths(schedule.months);
 
   return (
     schedule?.enabled === true &&
     normaliseDays(schedule.days).includes(local.day) &&
+    (months.length === 0 || months.includes(local.month)) &&
     String(schedule.time) === local.time
   );
 }
@@ -990,7 +1001,7 @@ async function runSchedules(env, timestamp = Date.now()) {
   }
 
   for (const schedule of config.schedules) {
-    if (!scheduleMatches(env, schedule, date)) {
+    if (!scheduleMatches(schedule, local)) {
       continue;
     }
 
@@ -1140,7 +1151,18 @@ label{
   gap:2px;
   font-size:.72rem;
 }
-.days input{width:auto}
+.days input,.months input{width:auto}
+.months{
+  display:grid;
+  grid-template-columns:repeat(auto-fit,minmax(64px,1fr));
+  gap:6px;
+}
+.months label{
+  display:flex;
+  align-items:center;
+  gap:4px;
+}
+.month-picker{margin:10px 0;min-width:0}
 .hide{display:none}
 .status{
   white-space:pre-wrap;
@@ -1367,7 +1389,7 @@ details.panel[open] summary{
 <details class="panel">
   <summary>
     Schedules
-    <span class="summary-note">Weekly ON/OFF rules</span>
+    <span class="summary-note">Weekly ON/OFF rules by month</span>
   </summary>
 
   <div class="panel-body">
@@ -1745,6 +1767,7 @@ function scheduleRow(schedule = {}){
     days: Array.isArray(schedule.days)
       ? schedule.days
       : [],
+    months: Array.isArray(schedule.months) ? schedule.months : [],
     time: schedule.time || "08:00",
     action:
       schedule.action ||
@@ -1758,12 +1781,18 @@ function scheduleRow(schedule = {}){
 }
 
 function addSchedule(){
-  cfg.schedules = cfg.schedules || [];
+  preserveScheduleDraft();
   cfg.schedules.push(scheduleRow());
   renderSchedules();
 }
 
+function preserveScheduleDraft(){
+  cfg.schedules = collectSchedules();
+  cfg.schedulesDisabled = $("disableSchedules").checked;
+}
+
 function deleteSchedule(id){
+  preserveScheduleDraft();
   cfg.schedules =
     (cfg.schedules || [])
       .filter((item) => item.id !== id);
@@ -1867,6 +1896,20 @@ function renderSchedules(){
           .join("") +
       '</div>' +
 
+      '<fieldset class="month-picker">' +
+        '<legend>Months (none selected means all year)</legend>' +
+        '<div class="months">' +
+          ["Jan","Feb","Mar","Apr","May","Jun","Jul","Aug","Sep","Oct","Nov","Dec"]
+            .map((month, index) =>
+              '<label><input data-month="' + (index + 1) +
+              '" type="checkbox" ' +
+              (s.months.includes(index + 1) ? "checked" : "") +
+              '> ' + month + '</label>'
+            )
+            .join("") +
+        '</div>' +
+      '</fieldset>' +
+
       '<div class="r onfields ' +
         (action.type === "off" ? "hide" : "") +
         '">' +
@@ -1938,6 +1981,8 @@ function collectSchedules(){
       ]
         .filter((checkbox) => checkbox.checked)
         .map((checkbox) => checkbox.dataset.day),
+      months: [...element.querySelectorAll('[data-month]:checked')]
+        .map(checkbox => Number(checkbox.dataset.month)),
       time:
         element.querySelector(
           '[data-f="time"]'
