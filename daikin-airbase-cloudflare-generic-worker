@@ -707,6 +707,27 @@ function normaliseMonths(months) {
   ))].sort((a, b) => a - b);
 }
 
+function scheduleEvents(schedules) {
+  const events = schedules.flatMap(schedule => {
+    if (schedule.action.type !== "on" || !schedule.offTime) return [schedule];
+    return [schedule, {
+      ...schedule,
+      time: schedule.offTime,
+      action: { type: "off" },
+    }];
+  });
+  // At a shared boundary, stop the previous window before starting the next.
+  return events.sort((a, b) => Number(a.action.type === "on") - Number(b.action.type === "on"));
+}
+
+function linkedOffTime(schedule) {
+  const time = schedule?.offTime;
+  return schedule?.action?.type !== "off" &&
+    typeof time === "string" &&
+    /^([01]\d|2[0-3]):[0-5]\d$/.test(time) &&
+    time > String(schedule?.time || "") ? time : "";
+}
+
 function normaliseSchedule(schedule, index = 0) {
   return {
     id: String(
@@ -721,6 +742,8 @@ function normaliseSchedule(schedule, index = 0) {
     )
       ? String(schedule.time)
       : "08:00",
+    offTime: linkedOffTime(schedule),
+    leaveRunning: schedule?.leaveRunning === true && !linkedOffTime(schedule),
     action: normaliseAction(schedule),
   };
 }
@@ -1000,7 +1023,7 @@ async function runSchedules(env, timestamp = Date.now()) {
     return;
   }
 
-  for (const schedule of config.schedules) {
+  for (const schedule of scheduleEvents(config.schedules)) {
     if (!scheduleMatches(schedule, local)) {
       continue;
     }
@@ -1318,6 +1341,18 @@ details.panel[open] summary{
 @media(max-width:380px){
   .g,.live-controls{grid-template-columns:1fr}
 }
+.schedule-table{width:100%;table-layout:fixed;text-align:left;border-collapse:collapse}
+.schedule-table th,.schedule-table td{padding:5px 3px;vertical-align:top;overflow-wrap:anywhere}
+.schedule-table td{border-top:1px solid #dbe2ec}
+.schedule-table button{width:100%;white-space:normal;text-align:left;font-size:.84rem}
+.schedule-alert{color:#9b2226;font-weight:600}
+#scheduleEditor{width:min(440px,calc(100% - 28px));box-sizing:border-box;border:1px solid #bfcce0;border-radius:12px}
+#scheduleEditor::backdrop{background:#10172988}
+#scheduleEditor [hidden]{display:none}
+#scheduleEditor fieldset{margin:8px 0;min-width:0}
+#scheduleEditor label{display:block;margin:3px 0}
+#scheduleEditor input[type=checkbox]{width:auto}
+.schedule-choices{display:grid;grid-template-columns:repeat(auto-fit,minmax(65px,1fr));gap:4px}
 </style>
 </head>
 <body>
@@ -1395,16 +1430,31 @@ details.panel[open] summary{
   <div class="panel-body">
     <div class="schedule-master">
       <label>
-        <input id="disableSchedules" type="checkbox">
+        <input id="disableSchedules" type="checkbox" onchange="if(cfg) cfg.schedulesDisabled=this.checked">
         Disable all schedules
       </label>
       <span id="scheduleMasterState" class="muted">Schedules active</span>
     </div>
 
     <div id="schedules"></div>
+<p id="scheduleWarning" class="schedule-alert" role="status"></p>
+<dialog id="scheduleEditor">
+  <form id="scheduleEditorForm">
+    <h3 id="scheduleEditorTitle"></h3>
+    <div id="scheduleEditorFields"></div>
+    <p id="scheduleEditorError" class="schedule-alert" role="alert"></p>
+    <div class="r">
+      <button type="button" onclick="document.getElementById('scheduleEditor').close()">Cancel</button>
+      <button type="button" id="scheduleDelete">Remove schedule</button>
+      <button type="button" id="scheduleLeaveRunning">Leave running</button>
+      <button type="submit" class="p">Done</button>
+    </div>
+  </form>
+</dialog>
 
     <div class="r">
       <button onclick="addSchedule()">Add schedule</button>
+      <button onclick="addSchedule(true)">Add off-only rule</button>
       <button
         id="saveSchedulesBtn"
         class="p"
@@ -1753,74 +1803,6 @@ async function adjustTemp(delta){
   );
 }
 
-function scheduleRow(schedule = {}){
-  return {
-    id:
-      schedule.id ||
-      (
-        "schedule-" +
-        Date.now() +
-        "-" +
-        Math.random().toString(36).slice(2, 6)
-      ),
-    enabled: schedule.enabled !== false,
-    days: Array.isArray(schedule.days)
-      ? schedule.days
-      : [],
-    months: Array.isArray(schedule.months) ? schedule.months : [],
-    time: schedule.time || "08:00",
-    action:
-      schedule.action ||
-      {
-        type: "on",
-        mode: "heat",
-        temperature: 23,
-        fan: "auto",
-      },
-  };
-}
-
-function addSchedule(){
-  preserveScheduleDraft();
-  cfg.schedules.push(scheduleRow());
-  renderSchedules();
-}
-
-function preserveScheduleDraft(){
-  cfg.schedules = collectSchedules();
-  cfg.schedulesDisabled = $("disableSchedules").checked;
-}
-
-function deleteSchedule(id){
-  preserveScheduleDraft();
-  cfg.schedules =
-    (cfg.schedules || [])
-      .filter((item) => item.id !== id);
-
-  renderSchedules();
-}
-
-function typeChange(select){
-  const box = select.closest(".s");
-  const onFields = box.querySelector(".onfields");
-
-  onFields.classList.toggle(
-    "hide",
-    select.value === "off"
-  );
-}
-
-function modeChange(select){
-  const box = select.closest(".s");
-  const tempField =
-    box.querySelector(".tempfield");
-
-  tempField.classList.toggle(
-    "hide",
-    select.value === "dry"
-  );
-}
-
 function renderScheduleMaster(){
   const checkbox = $("disableSchedules");
   const label = $("scheduleMasterState");
@@ -1836,194 +1818,170 @@ function renderScheduleMaster(){
       : "Schedules active";
 }
 
-function renderSchedules(){
-  renderScheduleMaster();
+const scheduleDays = ["Mon","Tue","Wed","Thu","Fri","Sat","Sun"];
+const scheduleMonths = ["Jan","Feb","Mar","Apr","May","Jun","Jul","Aug","Sep","Oct","Nov","Dec"];
 
-  const root = $("schedules");
-  root.innerHTML = "";
-
-  const schedules = cfg?.schedules || [];
-
-  if (!schedules.length){
-    root.innerHTML =
-      '<p class="muted">No schedules configured.</p>';
-    return;
-  }
-
-  for (const schedule of schedules){
-    const s = scheduleRow(schedule);
-    const action = s.action || {};
-    const selectedDays =
-      Array.isArray(s.days) ? s.days : [];
-
-    const element =
-      document.createElement("div");
-
-    element.className = "s";
-    element.dataset.id = s.id;
-
-    element.innerHTML =
-      '<div class="r">' +
-        '<label><input data-f="enabled" type="checkbox" ' +
-          (s.enabled ? "checked" : "") +
-          ' style="width:auto"> Enabled</label>' +
-        '<div><label>Time</label>' +
-          '<input data-f="time" type="time" value="' +
-          (s.time || "08:00") +
-          '"></div>' +
-        '<div><label>Action</label>' +
-          '<select data-f="type" onchange="typeChange(this)">' +
-            '<option value="on" ' +
-              (action.type === "on" ? "selected" : "") +
-              '>ON</option>' +
-            '<option value="off" ' +
-              (action.type === "off" ? "selected" : "") +
-              '>OFF</option>' +
-          '</select></div>' +
-      '</div>' +
-
-      '<div class="days">' +
-        ["mon","tue","wed","thu","fri","sat","sun"]
-          .map((day) =>
-            '<label><input data-day="' +
-            day +
-            '" type="checkbox" ' +
-            (selectedDays.includes(day) ? "checked" : "") +
-            '>' +
-            day.toUpperCase() +
-            '</label>'
-          )
-          .join("") +
-      '</div>' +
-
-      '<fieldset class="month-picker">' +
-        '<legend>Months (none selected means all year)</legend>' +
-        '<div class="months">' +
-          ["Jan","Feb","Mar","Apr","May","Jun","Jul","Aug","Sep","Oct","Nov","Dec"]
-            .map((month, index) =>
-              '<label><input data-month="' + (index + 1) +
-              '" type="checkbox" ' +
-              (s.months.includes(index + 1) ? "checked" : "") +
-              '> ' + month + '</label>'
-            )
-            .join("") +
-        '</div>' +
-      '</fieldset>' +
-
-      '<div class="r onfields ' +
-        (action.type === "off" ? "hide" : "") +
-        '">' +
-
-        '<div><label>Mode</label>' +
-          '<select data-f="mode" onchange="modeChange(this)">' +
-          ["heat","cool","dry"]
-            .map((mode) =>
-              '<option ' +
-              (action.mode === mode ? "selected" : "") +
-              '>' +
-              mode +
-              '</option>'
-            )
-            .join("") +
-          '</select></div>' +
-
-        '<div class="tempfield ' +
-          (action.mode === "dry" ? "hide" : "") +
-          '">' +
-          '<label>Temperature °C</label>' +
-          '<input data-f="temperature" type="number" value="' +
-          (action.temperature ?? 23) +
-          '">' +
-        '</div>' +
-
-        '<div><label>Fan</label>' +
-          '<select data-f="fan">' +
-          ["auto","low","medium","high"]
-            .map((fan) =>
-              '<option ' +
-              (action.fan === fan ? "selected" : "") +
-              '>' +
-              fan +
-              '</option>'
-            )
-            .join("") +
-          '</select></div>' +
-
-      '</div>' +
-
-      '<button onclick="deleteSchedule(\\'' +
-      s.id +
-      '\\')">Delete</button>';
-
-    root.appendChild(element);
-  }
+function scheduleChoices(names, values, selected){
+  return '<div class="schedule-choices">' + names.map((name, i) =>
+    '<label><input type="checkbox" value="' + values[i] + '"' +
+    (selected.includes(values[i]) ? ' checked' : '') + '> ' + name + '</label>'
+  ).join("") + '</div>';
 }
 
-function collectSchedules(){
-  return [
-    ...document.querySelectorAll(".s"),
-  ].map((element) => {
-    const type =
-      element.querySelector(
-        '[data-f="type"]'
-      ).value;
-
-    const base = {
-      id: element.dataset.id,
-      enabled:
-        element.querySelector(
-          '[data-f="enabled"]'
-        ).checked,
-      days: [
-        ...element.querySelectorAll(
-          "[data-day]"
-        ),
-      ]
-        .filter((checkbox) => checkbox.checked)
-        .map((checkbox) => checkbox.dataset.day),
-      months: [...element.querySelectorAll('[data-month]:checked')]
-        .map(checkbox => Number(checkbox.dataset.month)),
-      time:
-        element.querySelector(
-          '[data-f="time"]'
-        ).value,
-    };
-
-    if (type === "off"){
-      return {
-        ...base,
-        action: { type: "off" },
-      };
-    }
-
-    const mode =
-      element.querySelector(
-        '[data-f="mode"]'
-      ).value;
-
-    const action = {
-      type: "on",
-      mode,
-      fan:
-        element.querySelector(
-          '[data-f="fan"]'
-        ).value,
-    };
-
-    if (mode !== "dry"){
-      action.temperature =
-        Number(
-          element.querySelector(
-            '[data-f="temperature"]'
-          ).value
-        );
-    }
-
-    return {
-      ...base,
-      action,
-    };
+function addSchedule(offOnly = false){
+  cfg ||= { schedules: [], schedulesDisabled: false };
+  cfg.schedules.push({
+    id: "schedule-" + crypto.randomUUID(),
+    enabled: true, days: ["mon","tue","wed","thu","fri","sat","sun"],
+    months: [], time: "08:00", offTime: "", leaveRunning: false,
+    action: offOnly ? {type:"off"} : {type:"on",mode:"heat",temperature:23,fan:"auto"}
   });
+  renderSchedules();
+  editSchedule(cfg.schedules.length - 1, offOnly ? "off" : "on");
+}
+
+function scheduleNeedsOff(s){
+  return s.enabled && s.action.type === "on" &&
+    !s.leaveRunning && (!s.offTime || s.offTime <= s.time);
+}
+
+function checkScheduleDraft(){
+  const missing = (cfg?.schedules || []).filter(scheduleNeedsOff).length;
+  const warning = $("scheduleWarning");
+  warning.textContent = missing ? missing + (missing === 1
+    ? " schedule needs a turn-off time or Leave running."
+    : " schedules need a turn-off time or Leave running.") : "";
+  return missing === 0;
+}
+
+function renderSchedules(){
+  renderScheduleMaster();
+  const root = $("schedules");
+  root.replaceChildren();
+  const schedules = cfg?.schedules || [];
+  checkScheduleDraft();
+  if (!schedules.length){
+    root.textContent = "No schedules configured.";
+    return;
+  }
+  const table = document.createElement("table");
+  table.className = "schedule-table";
+  table.innerHTML = "<thead><tr><th>Days and months</th><th>Turn on</th><th>Turn off</th></tr></thead>";
+  const body = table.createTBody();
+  schedules.forEach((s, index) => {
+    const row = body.insertRow();
+    const days = (s.days || []).map(pretty).join(", ") || "No days";
+    const months = (s.months || []).map(month => scheduleMonths[month - 1]).join(", ") || "All year";
+    const offOnly = s.action.type === "off";
+    const onSettings = [
+      s.time, pretty(s.action.mode),
+      s.action.mode === "dry" ? "" : s.action.temperature + "°C",
+      pretty(s.action.fan) + " fan"
+    ].filter(Boolean).join(" · ");
+    const cells = [
+      ["when", days + " · " + months, s.enabled ? "" : "Disabled"],
+      ["on", offOnly ? "—" : onSettings, ""],
+      ["off", offOnly ? s.time : s.offTime || (s.leaveRunning ? "Left running" : "No scheduled shut-off"),
+        s.offTime && s.offTime <= s.time ? "Must be later than ON" : ""]
+    ];
+    for (const [part, label, note] of cells){
+      const cell = row.insertCell();
+      if (part === "on" && offOnly){
+        cell.textContent = label;
+        continue;
+      }
+      const button = document.createElement("button");
+      button.type = "button";
+      button.textContent = note ? label + " · " + note : label;
+      if (part === "off" && scheduleNeedsOff(s)) button.className = "schedule-alert";
+      button.onclick = () => editSchedule(index, part);
+      cell.append(button);
+    }
+  });
+  root.append(table);
+}
+
+function editSchedule(index, part){
+  const s = cfg.schedules[index];
+  const offOnly = s.action.type === "off";
+  const dialog = $("scheduleEditor");
+  const fields = $("scheduleEditorFields");
+  const dayKeys = scheduleDays.map(day => day.toLowerCase());
+  const monthKeys = scheduleMonths.map((_, i) => i + 1);
+  $("scheduleEditorTitle").textContent = {when:"Days and months",on:"Turn on",off:"Turn off"}[part];
+  $("scheduleEditorError").textContent = "";
+  $("scheduleLeaveRunning").hidden = part !== "off" || offOnly;
+  $("scheduleDelete").hidden = part !== "when";
+  if (part === "when"){
+    fields.innerHTML =
+      '<label><input name="enabled" type="checkbox"' + (s.enabled ? ' checked' : '') + '> Enabled</label>' +
+      '<fieldset><legend>Days</legend>' + scheduleChoices(scheduleDays, dayKeys, s.days || []) + '</fieldset>' +
+      '<fieldset><legend>Months (none selected means all year)</legend>' +
+      scheduleChoices(scheduleMonths, monthKeys, s.months || []) + '</fieldset>';
+  } else {
+    fields.innerHTML = '<label>Time <input name="time" type="time" required></label>';
+    const time = fields.querySelector('[name="time"]');
+    time.value = part === "on" || offOnly ? s.time : s.offTime || "";
+    if (part === "on"){
+      fields.insertAdjacentHTML("beforeend",
+        '<label>Mode <select name="mode"><option value="heat">Heat</option><option value="cool">Cool</option><option value="dry">Dry</option></select></label>' +
+        '<label data-temp>Temperature °C <input name="temperature" type="number" required></label>' +
+        '<label>Fan <select name="fan"><option value="auto">Auto</option><option value="low">Low</option><option value="medium">Medium</option><option value="high">High</option></select></label>');
+      const mode = fields.querySelector('[name="mode"]');
+      const temp = fields.querySelector('[name="temperature"]');
+      mode.value = s.action.mode;
+      temp.value = s.action.temperature ?? 23;
+      fields.querySelector('[name="fan"]').value = s.action.fan;
+      mode.onchange = () => {
+        temp.disabled = mode.value === "dry";
+        temp.closest("[data-temp]").hidden = temp.disabled;
+        temp.min = mode.value === "cool" ? 23 : 16;
+        temp.max = mode.value === "cool" ? 32 : 31;
+        if (Number(temp.value) < Number(temp.min)) temp.value = temp.min;
+        if (Number(temp.value) > Number(temp.max)) temp.value = temp.max;
+      };
+      mode.onchange();
+    }
+  }
+  function finish(){
+    dialog.close();
+    renderSchedules();
+  }
+  $("scheduleLeaveRunning").onclick = () => {
+    s.offTime = "";
+    s.leaveRunning = true;
+    finish();
+  };
+  $("scheduleDelete").onclick = () => {
+    cfg.schedules.splice(index, 1);
+    finish();
+  };
+  $("scheduleEditorForm").onsubmit = event => {
+    event.preventDefault();
+    const data = new FormData(event.currentTarget);
+    if (part === "when"){
+      const groups = fields.querySelectorAll("fieldset");
+      const chosen = group => [...group.querySelectorAll("input:checked")].map(input => input.value);
+      s.days = chosen(groups[0]);
+      s.months = chosen(groups[1]).map(Number);
+      s.enabled = data.has("enabled");
+    } else if (part === "off" && !offOnly){
+      if (data.get("time") <= s.time){
+        $("scheduleEditorError").textContent = "Choose a time later than turn-on on the same day.";
+        return;
+      }
+      s.offTime = data.get("time");
+      s.leaveRunning = false;
+    } else {
+      s.time = data.get("time");
+      if (!offOnly){
+        s.action = {type:"on",mode:data.get("mode"),fan:data.get("fan")};
+        if (s.action.mode !== "dry") s.action.temperature = Number(data.get("temperature"));
+      }
+    }
+    finish();
+  };
+  dialog.showModal();
 }
 
 async function loadConfig(){
@@ -2033,6 +1991,7 @@ async function loadConfig(){
 }
 
 async function saveSchedules(){
+  if (!checkScheduleDraft()) return;
   try {
     buttonBusy(
       "saveSchedulesBtn",
@@ -2050,7 +2009,7 @@ async function saveSchedules(){
     const data = await api("/config", {
       method: "PUT",
       body: JSON.stringify({
-        schedules: collectSchedules(),
+        schedules: cfg.schedules,
         schedulesDisabled:
           $("disableSchedules").checked,
       }),
