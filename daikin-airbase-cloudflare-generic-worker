@@ -1880,16 +1880,12 @@ function renderSchedules(){
     ].filter(Boolean).join(" · ");
     const cells = [
       ["when", days + " · " + months, s.enabled ? "" : "Disabled"],
-      ["on", offOnly ? "—" : onSettings, ""],
+      ["on", offOnly ? "Add turn-on" : onSettings, ""],
       ["off", offOnly ? s.time : s.offTime || (s.leaveRunning ? "Left running" : "No scheduled shut-off"),
         s.offTime && s.offTime <= s.time ? "Must be later than ON" : ""]
     ];
     for (const [part, label, note] of cells){
       const cell = row.insertCell();
-      if (part === "on" && offOnly){
-        cell.textContent = label;
-        continue;
-      }
       const button = document.createElement("button");
       button.type = "button";
       button.textContent = note ? label + " · " + note : label;
@@ -1921,7 +1917,7 @@ function editSchedule(index, part){
   } else {
     fields.innerHTML = '<label>Time <input name="time" type="time" required></label>';
     const time = fields.querySelector('[name="time"]');
-    time.value = part === "on" || offOnly ? s.time : s.offTime || "";
+    time.value = part === "on" && offOnly ? "" : part === "on" || offOnly ? s.time : s.offTime || "";
     if (part === "on"){
       fields.insertAdjacentHTML("beforeend",
         '<label>Mode <select name="mode"><option value="heat">Heat</option><option value="cool">Cool</option><option value="dry">Dry</option></select></label>' +
@@ -1929,9 +1925,9 @@ function editSchedule(index, part){
         '<label>Fan <select name="fan"><option value="auto">Auto</option><option value="low">Low</option><option value="medium">Medium</option><option value="high">High</option></select></label>');
       const mode = fields.querySelector('[name="mode"]');
       const temp = fields.querySelector('[name="temperature"]');
-      mode.value = s.action.mode;
+      mode.value = s.action.mode || "heat";
       temp.value = s.action.temperature ?? 23;
-      fields.querySelector('[name="fan"]').value = s.action.fan;
+      fields.querySelector('[name="fan"]').value = s.action.fan || "auto";
       mode.onchange = () => {
         temp.disabled = mode.value === "dry";
         temp.closest("[data-temp]").hidden = temp.disabled;
@@ -1972,12 +1968,22 @@ function editSchedule(index, part){
       }
       s.offTime = data.get("time");
       s.leaveRunning = false;
+    } else if (part === "on"){
+      const startTime = data.get("time");
+      const stopTime = offOnly ? s.time : s.offTime;
+      if (stopTime && startTime >= stopTime){
+        $("scheduleEditorError").textContent = "Choose a turn-on time earlier than turn-off on the same day.";
+        return;
+      }
+      if (offOnly) {
+        s.offTime = stopTime;
+        s.leaveRunning = false;
+      }
+      s.time = startTime;
+      s.action = {type:"on",mode:data.get("mode"),fan:data.get("fan")};
+      if (s.action.mode !== "dry") s.action.temperature = Number(data.get("temperature"));
     } else {
       s.time = data.get("time");
-      if (!offOnly){
-        s.action = {type:"on",mode:data.get("mode"),fan:data.get("fan")};
-        if (s.action.mode !== "dry") s.action.temperature = Number(data.get("temperature"));
-      }
     }
     finish();
   };
